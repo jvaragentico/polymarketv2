@@ -1,0 +1,108 @@
+import {createInterface} from 'node:readline';
+import {createSecureClient,OrderSide} from '@polymarket/client';
+import {privateKey} from '@polymarket/client/viem';
+import {fetchBalanceAllowance} from '@polymarket/client/actions';
+import {privateKeyToAccount} from 'viem/accounts';
+import {polygon} from 'viem/chains';
+import {isAddress} from 'viem';
+import {validateOrder} from '../frontend/wallet-policy.js';
+import {runAutomatic} from './automatic-runner.js';
+import {redeemBotPositions} from './redeem-bot-positions.js';
+import {resolveAccountWallet} from './account-wallet.js';
+
+// Read the key only from the launcher's anonymous stdin pipe. Never log SDK errors
+// verbatim: transports and signing errors may include payload or request details.
+let secret = '', options = {}, stage = 'input';
+try {
+  const lines = [];
+  for await (const line of createInterface({input:process.stdin,terminal:false})) {
+    if (lines.length >= 2 || line.length > 4096) throw new Error('Invalid input.');
+    lines.push(line);
+  }
+  secret = lines[0]?.trim() || '';
+  if (/^0x/i.test(secret)) secret = '0x'+secret.slice(2);
+  else secret = '0x'+secret;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(secret)) throw new Error('Invalid key format.');
+  stage = 'launcher configuration';
+  options = JSON.parse(lines[1] || '{}');
+  stage = 'signer verification';
+  const account = privateKeyToAccount(secret);
+  lines.fill('');
+  console.log('Signer address: '+account.address);
+  if (options.expectedSigner && options.expectedSigner.toLowerCase() !== account.address.toLowerCase()) throw new Error('Signer mismatch.');
+  if (options.action === 'address') {
+    console.log('Address verified locally. No funds moved and no exchange request sent.');
+  } else {
+    if (!['balance','orders','buy','cancel','auto'].includes(options.action)) throw new Error('Invalid action.');
+    if (options.wallet && !isAddress(options.wallet)) throw new Error('Invalid trading wallet.');
+    const json = async url => {const r=await fetch(url,{signal:AbortSignal.timeout(15000)});if(!r.ok)throw new Error('Service unavailable.');return r.json();};
+    async function eligible() {const geo=await json('https://polymarket.com/api/geoblock');if(geo.blocked!==false)throw new Error('Trading is restricted at this location.');}
+    if (['buy','auto'].includes(options.action)) {stage='location eligibility';await eligible();}
+    let review = null;
+    const signGuard = {check:null};
+    const adapter=privateKey(secret,{chain:polygon});
+    async function checkLocalGuard() {
+      try {await signGuard.check?.();}
+      catch {
+        const error=new Error('Local order guard rejected the intent before submission.');
+        error.code='LOCAL_GUARD_REJECTED';
+        throw error;
+      }
+    }
+    const signer={...adapter,async signTypedData(payload){await checkLocalGuard();const signature=await adapter.signTypedData(payload);if(review)validateOrder(options,review);await checkLocalGuard();return signature;}};
+    stage='exchange client setup';
+    // A Polymarket account wallet may differ from its MetaMask signer. The
+    // public profile identifies the funder; SDK derivation covers new accounts.
+    const accountWallet=await resolveAccountWallet(account.address,options.wallet);
+    const client=await createSecureClient(accountWallet ? {signer,wallet:accountWallet} : {signer});
+    console.log('Trading wallet: '+client.account.wallet);
+    console.log('Trading wallet type: '+client.account.walletType);
+    if(options.action === 'auto') {
+      stage='automatic session startup or execution';
+      await runAutomatic({client,options,eligible,signGuard});
+      if(options.autoRedeem===true) {
+        try {await redeemBotPositions({client,onStatus:message=>console.log(message)});}
+        catch {console.log('Automatic redemption check unavailable. Existing winning positions may still need redemption.');}
+      }
+    } else if(options.action === 'balance') {
+      const b=await fetchBalanceAllowance(client,{assetType:'COLLATERAL'});
+      console.log('Trading collateral base units: '+String(b.balance));
+      console.log('Trading collateral USD: $'+(Number(b.balance)/1000000).toFixed(2));
+      console.log('Collateral decimals: 6.');
+      if(BigInt(b.balance)===0n)console.log('No trading collateral at this wallet. Compare the trading wallet above with the account wallet in the Polymarket profile menu. Do not deposit again until they match.');
+    } else if(options.action === 'orders') {
+      let count=0;
+      for await(const page of client.listOpenOrders()) for(const o of page.items) {
+        count++;
+        console.log(JSON.stringify({id:o.id,side:o.side,price:o.price,status:o.status}));
+      }
+      if(count===0)console.log('No open orders returned by the authenticated exchange.');
+    } else if(options.action === 'cancel') {
+      const r=await client.cancelOrder({orderId:options.orderId});
+      console.log(JSON.stringify(r));
+    } else {
+      await eligible();
+      review=await json('http://127.0.0.1:8787/api/market?slug='+encodeURIComponent(options.slug));
+      const checked=validateOrder(options,review);
+      const b=await fetchBalanceAllowance(client,{assetType:'COLLATERAL'});
+      if(BigInt(b.balance)<checked.cost)throw new Error('Insufficient trading collateral.');
+      validateOrder(options,review);
+      const result=await client.placeLimitOrder({tokenId:checked.tokenId,side:OrderSide.BUY,price:options.price,size:options.size,postOnly:true});
+      console.log(JSON.stringify({ok:result.ok,orderId:result.orderId,status:result.status,code:result.code}));
+      if(!result.ok)process.exitCode=1;
+    }
+  }
+} catch (error) {
+  // Intentionally redact exception details; never echo invalid key input.
+  console.error('Wallet action failed during '+stage+'. Check key format, account wallet, funding, eligibility, market inputs and network connection.');
+  const publicErrors=new Set(['Signer mismatch.','Trading is restricted at this location.',
+    'Requested wallet differs from the Polymarket account wallet for this signer.',
+    'Session capital exceeds available collateral.',
+    'Account valuation unavailable during automatic startup. Check collateral and portfolio in Polymarket before retrying.',
+    'Account valuation unavailable during automatic execution. Check open orders and positions before retrying.',
+    'Existing orders must be reconciled before starting.','Existing market inventory must be reconciled before starting.']);
+  if(error?.message==='Invalid key format.')console.error('Key format is invalid. Enter exactly 64 hexadecimal characters, optionally prefixed with 0x.');
+  else if(publicErrors.has(error?.message))console.error(error.message);
+  process.exitCode=1;
+} finally {secret='';}
+

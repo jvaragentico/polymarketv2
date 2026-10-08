@@ -1,0 +1,16 @@
+{
+    "name":  "polymarket-v2",
+    "private":  true,
+    "type":  "module",
+    "scripts":  {
+                    "test":  "node --test --test-isolation=none frontend/*.test.js tests/*.test.js"
+                },
+    "dependencies":  {
+                         "@polymarket/client":  "0.11.0",
+                         "viem":  "2.56.9"
+                     },
+    "devDependencies":  {
+                            "esbuild":  "0.28.2"
+                        }
+}
+

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-v2"
+version = "0.2.0"
+description = "Multi-asset Polymarket paper laboratory with a separate disabled-by-default live executor"
+requires-python = ">=3.11"
+dependencies = ["websockets>=15,<17"]
+
+[project.scripts]
+paperbot = "polymarket_bot.paper:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+

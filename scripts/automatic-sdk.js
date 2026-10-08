@@ -1,0 +1,207 @@
+import {OrderSide,OrderType,RequestRejectedError} from '@polymarket/client';
+import {fetchBalanceAllowance} from '@polymarket/client/actions';
+import {units,validateOrder} from '../frontend/wallet-policy.js';
+
+export function createSdkExchange({client,engine,eligible,signGuard=null,readBalance=null,now=()=>Date.now()/1000}) {
+  const reviewed=new Map();
+  const wallet=String(client.account.wallet).toLowerCase();
+  async function balance() {return readBalance ? readBalance() : fetchBalanceAllowance(client,{assetType:'COLLATERAL'});}
+  async function accountValue() {
+    const [cash,positions]=await Promise.all([balance(),client.fetchPortfolioValue({user:wallet})]);
+    if(!positions || String(positions.wallet).toLowerCase()!==wallet)throw new Error('Portfolio wallet mismatch.');
+    const cashUnits=BigInt(cash.balance),positionUnits=units(positions.value);
+    if(cashUnits<0n)throw new Error('Invalid account collateral.');
+    return {cashUnits,positionUnits,totalUnits:cashUnits+positionUnits};
+  }
+  function profitableExit(state,shares,price) {
+    if(!Number.isFinite(price) || price<=0 || price>=1 || !state.portfolio || units(state.portfolio.paired_shares)!==0n)return false;
+    const cost=units(state.portfolio.total_cost);
+    if(cost<=0n)return false;
+    const gross=units(shares)*BigInt(Math.floor(price*1000000))/1000000n;
+    // Allow 10% of gross for taker fees, adverse rounding, and quote drift.
+    return gross*90n/100n >= cost+units('0.10');
+  }
+  async function ownSingleSide(state) {
+    if(!/^(btc|eth|xrp|sol)-updown-5m-\d+$/.test(state.market.slug) || !state.portfolio ||
+        units(state.portfolio.paired_shares)!==0n)return null;
+    const active=[];
+    for await(const page of client.listPositions({user:wallet,conditionId:state.conditionId,filterAmount:0}))
+      for(const position of page.items)if(units(position.currentSize)>0n)active.push(position);
+    if(active.length!==1)return null;
+    const p=active[0],tokenId=String(p.assetId);
+    const expected=tokenId===state.market.up_token?state.portfolio.residual_up:
+      tokenId===state.market.down_token?state.portfolio.residual_down:null;
+    if(p.wallet.toLowerCase()!==wallet || p.conditionId!==state.conditionId ||
+        expected===null || units(p.currentSize)!==units(expected))return null;
+    return {tokenId,shares:p.currentSize};
+  }
+  async function startup(state) {
+    await eligible();
+    if(!/^(btc|eth|xrp|sol)-updown-5m-\d+$/.test(state.market.slug))throw new Error('Automatic trading supports crypto Up/Down 5m only.');
+    const b=await balance();
+    if(units(state.config.capital)>BigInt(b.balance)) throw new Error('Session capital exceeds available collateral.');
+    for await(const page of client.listOpenOrders()) if(page.items.length) throw new Error('Existing orders must be reconciled before starting.');
+    for await(const page of client.listPositions({user:wallet,conditionId:state.conditionId,filterAmount:0}))
+      if(page.items.some(p=>p.conditionId!==state.conditionId || units(p.currentSize)!==0n)) throw new Error('Existing market inventory must be reconciled before starting.');
+  }
+  return {
+    startup,
+    accountValue,
+    async profitOpportunity(state) {
+      const position=await ownSingleSide(state);
+      if(!position)return false;
+      const price=await client.estimateMarketPrice({...position,side:OrderSide.SELL,orderType:OrderType.FOK});
+      return profitableExit(state,position.shares,price);
+    },
+    async liquidateOwnPositions(state,onResult=async()=>{},takeProfit=false) {
+      await eligible();
+      if(!/^(btc|eth|xrp|sol)-updown-5m-\d+$/.test(state.market.slug))throw new Error('Only supported crypto 5m inventory can be exited.');
+      if(takeProfit && !(await ownSingleSide(state)))return [];
+      const maximum={
+        [state.market.up_token]:units(state.portfolio.paired_shares)+units(state.portfolio.residual_up),
+        [state.market.down_token]:units(state.portfolio.paired_shares)+units(state.portfolio.residual_down)
+      };
+      const rows=[];
+      for await(const page of client.listPositions({user:wallet,conditionId:state.conditionId,filterAmount:0}))
+        rows.push(...page.items);
+      const attempted=new Set(),results=[];
+      for(const position of rows) {
+        const tokenId=String(position.assetId),size=units(position.currentSize);
+        if(position.wallet.toLowerCase()!==wallet || position.conditionId!==state.conditionId ||
+            !Object.hasOwn(maximum,tokenId))throw new Error('Unexpected account position during exit.');
+        if(size===0n)continue;
+        if(attempted.has(tokenId) || size>maximum[tokenId])throw new Error('Exit inventory exceeds this session’s confirmed fills.');
+        attempted.add(tokenId);
+        const shares=position.currentSize;
+        const price=await client.estimateMarketPrice({tokenId,side:OrderSide.SELL,shares,orderType:OrderType.FOK});
+        if(!Number.isFinite(price) || price<=0 || price>=1)throw new Error('No executable exit price.');
+        if(takeProfit && !profitableExit(state,shares,price))return [];
+        if(signGuard)signGuard.exit={tokenId,shares,minPrice:price};
+        let result;
+        try {
+          result=await client.placeMarketOrder({tokenId,side:OrderSide.SELL,shares,minPrice:price,orderType:OrderType.FOK});
+        } finally {if(signGuard)signGuard.exit=null;}
+        const record={tokenId,shares,minPrice:price,ok:result.ok===true,orderId:result.orderId||null,
+          status:result.status||null,confirmed:false};
+        results.push(record);
+        await onResult(record);
+        if(!result.ok || !result.orderId)throw new Error('Exit was not accepted; inspect positions.');
+        if(result.status!=='matched' || !Array.isArray(result.tradeIds) || !result.tradeIds.length)
+          throw new Error('Exit fill is not yet evidenced; inspect positions.');
+        const hashes=await client.waitForOrderFillSettlement(result);
+        if(!Array.isArray(hashes) || !hashes.length)throw new Error('Exit settlement was not confirmed.');
+        const order=await client.fetchOrder({orderId:result.orderId});
+        if(order.id!==result.orderId || order.makerAddress.toLowerCase()!==wallet || order.side!=='SELL' ||
+            String(order.assetId)!==tokenId || units(order.sizeMatched)!==size)
+          throw new Error('Exit order did not fully match this account position.');
+        record.confirmed=true;
+        await onResult(record);
+      }
+      return results;
+    },
+    async preflight(intent,state) {
+      const tokenId=intent.side==='Up'?state.market.up_token:state.market.down_token;
+      const [,value,book]=await Promise.all([eligible(),accountValue(),client.fetchOrderBook({tokenId})]);
+      if(state.market.fee_taker_only!==true || state.config.allow_taker) throw new Error('Automatic mode is maker-only.');
+      if(String(book.assetId)!==tokenId || book.negRisk!==false || book.conditionId!==state.conditionId) throw new Error('Unexpected order book.');
+      const market={slug:state.market.slug,endsAt:state.market.end,fetchedAt:now(),outcomes:{
+        [intent.side]:{tokenId,tick:book.tickSize,minSize:book.minOrderSize}}};
+      const order={slug:market.slug,outcome:intent.side,price:intent.price,size:intent.shares,confirmed:true};
+      const checked=validateOrder(order,market,now());
+      const reject=message=>{const error=new Error(message);error.code='LOCAL_PREFLIGHT_REJECTED';throw error;};
+      if(units(intent.price)>units(state.config.max_entry_price ?? '1'))reject('Entry price exceeds the live safety ceiling.');
+      if(checked.cost>units(state.config.order_dollars))reject('Order exceeds the configured cap.');
+      if(now()>=market.endsAt-60)reject('Crypto entry window closed with less than 60 seconds remaining.');
+      if(value.cashUnits<checked.cost)reject('Insufficient exchange collateral.');
+      reviewed.set(intent.localId,{order,market,tokenId});
+    },
+    async place(intent) {
+      const review=reviewed.get(intent.localId);
+      if(!review || review.order.price!==intent.price || review.order.size!==intent.shares) throw new Error('Missing reviewed intent.');
+      validateOrder(review.order,review.market,now());
+      // The CLI signer's before-sign hook repeats state and freshness checks.
+      if(signGuard)signGuard.intent=intent;
+      let signed;
+      try {
+        // createLimitOrder only prepares and signs. Any failure here is
+        // definitely before the exchange submission boundary.
+        signed=await client.createLimitOrder({tokenId:review.tokenId,side:OrderSide.BUY,price:intent.price,
+          size:intent.shares,postOnly:true});
+        await signGuard?.check?.();
+      } catch {
+        const rejected=new Error('Order preparation or local guard rejected the intent before submission.');
+        rejected.code='LOCAL_GUARD_REJECTED';
+        throw rejected;
+      } finally {if(signGuard)signGuard.intent=null;}
+      // An error after this point can mean the exchange accepted the order.
+      try {
+        return await client.postOrder(signed);
+      } catch(error) {
+        // A 400 response is an explicit exchange rejection of this order.
+        // Transport failures or malformed responses remain ambiguous.
+        if(error instanceof RequestRejectedError && error.status===400) {
+          const rejected=new Error('Exchange rejected this order.');
+          rejected.code='DEFINITE_ORDER_REJECTED';
+          throw rejected;
+        }
+        throw error;
+      }
+    },
+    async cancel(orderId) {
+      let result,requestError;
+      try {result=await client.cancelOrder({orderId});}
+      catch(error) {requestError=error;}
+      if(result?.canceled?.includes(orderId))return result;
+      const order=await client.fetchOrder({orderId});
+      const state=await engine.state();
+      if(order.id!==orderId || order.makerAddress?.toLowerCase()!==wallet || order.side!=='BUY' ||
+          ![state.market.up_token,state.market.down_token].includes(String(order.assetId)))
+        throw new Error('Cancellation order ownership or asset mismatch.');
+      if(['CANCELED','CANCELLED'].includes(String(order.status).toUpperCase()))return {canceled:[orderId]};
+      const original=units(order.originalSize),matched=units(order.sizeMatched);
+      if(original>0n && matched===original)return {canceled:[orderId],fullyFilled:true};
+      if(requestError)throw requestError;
+      return result;
+    },
+    async fills(orderId) {
+      const state=await engine.state();
+      const order=await client.fetchOrder({orderId});
+      if(order.id!==orderId || order.makerAddress.toLowerCase()!==wallet || order.side!=='BUY' ||
+          ![state.market.up_token,state.market.down_token].includes(String(order.assetId)))throw new Error('Order ownership or asset mismatch.');
+      const unique=new Map();
+      for await(const page of client.listAccountTrades({market:state.conditionId})) {
+        for(const trade of page.items) {
+          if(trade.conditionId!==state.conditionId)throw new Error('Account trade market mismatch.');
+          const matches=trade.makerOrders.filter(m=>m.orderId===orderId);
+          if(matches.length>1)throw new Error('Ambiguous maker fill.');
+          for(const maker of matches) {
+            if(maker.makerAddress.toLowerCase()!==wallet || maker.side!=='BUY' || String(maker.assetId)!==String(order.assetId)) throw new Error('Unexpected account fill.');
+            if(maker.feeRateBps!=null && units(maker.feeRateBps)!==0n)
+              throw new Error('Unexpected maker fee; reconcile the account manually.');
+            const status=trade.status==='TRADE_STATUS_CONFIRMED'?'CONFIRMED':
+              trade.status==='TRADE_STATUS_FAILED'?'FAILED':'PENDING';
+            const fill={orderId,id:trade.id+':'+trade.bucketIndex,status,
+              shares:maker.matchedAmount,price:maker.price,fee:'0'};
+            const previous=unique.get(fill.id);
+            if(previous && (units(previous.shares)!==units(fill.shares) || units(previous.price)!==units(fill.price)))
+              throw new Error('Account fill changed across pages.');
+            // Pagination may overlap while the trade progresses to confirmation.
+            // Never count a repeated trade twice or discard a failed settlement.
+            if(!previous || fill.status==='FAILED' ||
+                (previous.status!=='FAILED' && (fill.status==='CONFIRMED' || previous.status!=='CONFIRMED')))
+              unique.set(fill.id,fill);
+          }
+        }
+      }
+      const results=[...unique.values()];
+      // A match may arrive while the paginated trade history is being read.
+      const latest=await client.fetchOrder({orderId});
+      if(latest.id!==orderId || latest.makerAddress.toLowerCase()!==wallet || latest.side!=='BUY' ||
+          String(latest.assetId)!==String(order.assetId))throw new Error('Order identity changed during reconciliation.');
+      const observed=results.filter(f=>f.status!=='FAILED').reduce((sum,f)=>sum+units(f.shares),0n);
+      if(observed<units(latest.sizeMatched))results.push({orderId,id:'awaiting_account_trade',status:'PENDING'});
+      return results;
+    }
+  };
+}
+
