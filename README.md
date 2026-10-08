@@ -16,6 +16,24 @@ py -3 -m venv .venv
 
 If the repository is already on your computer, open PowerShell in that directory and begin at the `py -3 -m venv .venv` step.
 
+If PowerShell opens at `C:\Users\jojd1>` (or another directory), **change into the repository first**. Run each line in order; do not run a `scripts\...` command until the prompt shows the `polymarketv2` folder:
+
+```powershell
+cd 'C:\Users\jojd1\Documents\ChatGPT\newtardingproject\polymarketv2'
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\scripts\start-paper-crypto.ps1 -Markets 4
+```
+
+To open the dashboard, use a **second** PowerShell window and also change to the repository before starting it:
+
+```powershell
+cd 'C:\Users\jojd1\Documents\ChatGPT\newtardingproject\polymarketv2'
+.\scripts\start-paper-dashboard.ps1
+```
+
+Then open `http://127.0.0.1:8792/` in your browser. The dashboard command expects the paper environment from the first window to exist.
+
 The simulator selects the asset in a shuffled cycle, so each of the four assets is sampled once per four markets. The selected asset is random; the Up/Down decision is driven by the probability model and observed prices, never a coin flip. `-Markets` is the total number of market captures, not a number per asset. Use `-Assets btc,eth` to limit the selection or `-Seed 42` to reproduce an asset sequence. The simulator waits for a fresh 5-minute market, records about 90 seconds of public data, and waits up to five more minutes for an official result. A run may stop earlier if the official result is delayed; use `-Review` and resume later. It writes recordings and `runs\paper-summary.json`. Stop with `Ctrl+C`; this only stops data collection. To check pending resolutions and refresh the report later:
 
 ```powershell
@@ -68,6 +86,7 @@ The script prompts for the private key with hidden terminal input; never add the
 I have not run this funded path end to end. The simulator's queue fills are estimates, not exchange-confirmed fills, and the current paper sample has not demonstrated profit. Do not treat the command as a recommendation to fund or trade: first collect a meaningful out-of-sample paper record and review the code and current market rules. The strategy cannot guarantee profits or prevent losses.
 
 The public [bonereaper profile](https://polymarket.com/@bonereaper) and [Polymarket Data API](https://data-api.polymarket.com/v2/docs) show trades on both outcomes in some short crypto markets. This motivates tracking paired P&L, but public trades do not reveal unfilled quotes, queue priority, incentives, or the complete trading rules. The simulator does not copy that account or count its profile P&L as evidence that this $50 strategy is profitable.
+
 
 
 
