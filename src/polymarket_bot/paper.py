@@ -42,7 +42,7 @@ def public_clock_offset():
     raise ValueError("Could not verify public server time")
 
 
-def paper_config(balance, cap, research_weight=.01):
+def paper_config(balance, cap, research_weight=.01, cross_venue_weight=.005):
     """Match the live maker settings while limiting simulated market exposure."""
     balance, cap = Decimal(str(balance)), Decimal(str(cap))
     budget = min(balance, cap)
@@ -51,7 +51,8 @@ def paper_config(balance, cap, research_weight=.01):
     return Config(capital=float(balance), order_dollars=float(budget),
                   max_market_spend=float(budget), max_loss=float(budget),
                   max_net_shares=20, allow_taker=False, quote_lifetime=8,
-                  research_weight=research_weight)
+                  research_weight=research_weight,
+                  cross_venue_weight=cross_venue_weight)
 
 
 def official_winner(raw, market, expected_condition):
@@ -162,7 +163,8 @@ def summary(root):
             try:
                 recording_identity(directory)
                 report = replay(directory / "events.jsonl", paper_config(
-                    balance, cap, 0 if name.endswith("_baseline") else .01))
+                    balance, cap, 0 if name.endswith("_baseline") else .01,
+                    0 if name.endswith("_baseline") else .005))
             except (OSError, ValueError, KeyError, TypeError, StopIteration):
                 excluded.append(directory.name)
                 continue
@@ -199,6 +201,7 @@ def summary(root):
             wins += pnl > 0
             losses += pnl < 0
         variants[name] = dict(order_cap=str(cap), research_weight=(0 if name.endswith("_baseline") else .01),
+                              cross_venue_weight=(0 if name.endswith("_baseline") else .005),
                               starting_balance=str(STARTING_BALANCE),
                               settled_markets=settled, markets_with_fills=markets_with_fills,
                               simulated_fills=fills, wins=wins, losses=losses,
@@ -228,7 +231,8 @@ def record_one(root, after_slug=None, clock=time.time, asset="btc"):
         asyncio.run(shadow(market, paper_config(STARTING_BALANCE, 1), f"{asset.upper()}-USD", 90,
                            directory, spot_feed="chainlink_twap", clock=clock, capture_only=True,
                            preview_configs={name: paper_config(STARTING_BALANCE, cap,
-                                            0 if name.endswith("_baseline") else .01)
+                                            0 if name.endswith("_baseline") else .01,
+                                            0 if name.endswith("_baseline") else .005)
                                             for name, cap in CAPS.items()}))
     finally:
         if (directory / "events.jsonl").exists():
@@ -316,5 +320,6 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
 
 

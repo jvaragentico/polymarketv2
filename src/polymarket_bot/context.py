@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
 NEWS_URL = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+NEWS_URLS = (("CoinDesk", NEWS_URL), ("Cointelegraph", "https://cointelegraph.com/rss"))
 SOCIAL_URLS = {
     "btc": "https://www.reddit.com/r/Bitcoin/new/.rss?limit=10",
     "eth": "https://www.reddit.com/r/ethereum/new/.rss?limit=10",
@@ -53,8 +54,9 @@ def research_signal(record, asset, now=None):
             if positive == negative:
                 continue
             values.append(1 if positive else -1)
-            if source not in sources:
-                sources.append(source)
+            publisher = row.get("publisher", source)
+            if publisher not in sources:
+                sources.append(publisher)
     score = sum(values) / len(values) if values else 0.0
     return dict(score=score, items=len(values), sources=sources,
                 reason="experimental headline polarity" if values else "no fresh directional headlines")
@@ -116,17 +118,29 @@ class ResearchCache:
 
     def _refresh(self, asset):
         result = dict(checked_at=time.time(),
-                      news_source=NEWS_URL, social_source=SOCIAL_URLS[asset])
-        for name, url, parser in (("news", NEWS_URL, lambda root: parse_news(root, asset)),
-                                  ("social", SOCIAL_URLS[asset], parse_social)):
+                      news_source=" · ".join(name for name, _ in NEWS_URLS),
+                      social_source=SOCIAL_URLS[asset])
+        news, available, failures = [], [], []
+        for publisher, url in NEWS_URLS:
             try:
-                result[name] = parser(self.fetch(url))
-                result[name + "_status"] = "ok"
-            except (OSError, ValueError, ET.ParseError) as error:
-                result[name] = []
-                result[name + "_status"] = f"unavailable: {error}"
+                rows = parse_news(self.fetch(url), asset)
+                news.extend(dict(row, publisher=publisher) for row in rows)
+                available.append(publisher)
+            except (OSError, ValueError, ET.ParseError):
+                failures.append(publisher)
+        result["news"] = sorted(news, key=lambda row: row.get("published_at") or 0,
+                                reverse=True)[:8]
+        result["news_status"] = (f"ok · {len(available)} source(s)" if available else
+                                 "unavailable: " + ", ".join(failures))
+        try:
+            result["social"] = parse_social(self.fetch(SOCIAL_URLS[asset]))
+            result["social_status"] = "ok"
+        except (OSError, ValueError, ET.ParseError):
+            result["social"] = []
+            result["social_status"] = "unavailable"
         result["status"] = "ready"
         with self.lock:
             self.records[asset] = result
             self.loading.discard(asset)
+
 

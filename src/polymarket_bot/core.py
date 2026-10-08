@@ -42,6 +42,7 @@ class Config:
     volatility_floor: float = .00005
     momentum_weight: float = .15
     research_weight: float = .01
+    cross_venue_weight: float = .005
 
     def __post_init__(self):
         for key, value in asdict(self).items():
@@ -64,6 +65,8 @@ class Config:
             raise ValueError("max_entry_price must be in (0, 1]")
         if self.research_weight > .02:
             raise ValueError("research_weight cannot exceed two probability points")
+        if self.cross_venue_weight > .01:
+            raise ValueError("cross_venue_weight cannot exceed one probability point")
 
 
 @dataclass
@@ -319,6 +322,11 @@ class Engine:
         self.research_at = -math.inf
         self.research_sources = []
         self.research_adjustment = 0.0
+        self.external_spot = None
+        self.external_spot_at = -math.inf
+        self.external_spot_source_ts = -math.inf
+        self.cross_venue_score = 0
+        self.cross_venue_adjustment = 0.0
         self.actions = []
         self.events = 0
         self.trade_ids = set()
@@ -343,12 +351,19 @@ class Engine:
         self.now = ts
         self.events += 1
         kind = event["kind"]
-        if kind not in {"spot", "book", "delta", "tick", "resolution", "disconnect", "feed_reset", "trade", "clock", "session_stop", "research"}:
+        if kind not in {"spot", "external_spot", "book", "delta", "tick", "resolution", "disconnect", "feed_reset", "trade", "clock", "session_stop", "research"}:
             raise ValueError(f"Unknown event kind: {kind}")
         # Apply the observation first: delayed orders use the book available at arrival.
         if kind == "spot":
             self.model.update(ts, float(event["price"]), float(event.get("source_ts", ts)))
             self.spot_source = event.get("feed", "unspecified")
+        elif kind == "external_spot":
+            price = float(event["price"])
+            source_ts = float(event.get("source_ts", ts))
+            if not math.isfinite(price) or price <= 0 or not math.isfinite(source_ts):
+                raise ValueError("Invalid external spot observation")
+            self.external_spot, self.external_spot_at = price, ts
+            self.external_spot_source_ts = source_ts
         elif kind == "research":
             score = float(event["score"])
             items = event["items"]
@@ -393,7 +408,26 @@ class Engine:
         adjustment = (self.config.research_weight * self.research_score *
                       min(1, self.research_items / 2)) if ts - self.research_at <= 900 else 0
         self.research_adjustment = adjustment
-        self.q = (max(.01, min(.99, self.q_base + adjustment))
+        model_samples = getattr(self.model, "samples", ())
+        model_source_ts = getattr(self.model, "source_ts", -math.inf)
+        primary = (math.exp(model_samples[-1][1]) if model_samples and
+                   0 <= ts - model_samples[-1][0] <= self.config.max_feed_age and
+                   0 <= ts - model_source_ts <= self.config.max_feed_age else None)
+        cross_score = 0
+        if (primary is not None and self.external_spot is not None and
+                0 <= ts - self.external_spot_at <= self.config.max_feed_age and
+                0 <= ts - self.external_spot_source_ts <= self.config.max_feed_age):
+            primary_delta = math.log(primary / self.market.strike)
+            external_delta = math.log(self.external_spot / self.market.strike)
+            threshold = .0001
+            if primary_delta > threshold and external_delta > threshold:
+                cross_score = 1
+            elif primary_delta < -threshold and external_delta < -threshold:
+                cross_score = -1
+        self.cross_venue_score = cross_score
+        self.cross_venue_adjustment = self.config.cross_venue_weight * cross_score
+        total_adjustment = adjustment + self.cross_venue_adjustment
+        self.q = (max(.01, min(.99, self.q_base + total_adjustment))
                   if self.q_base is not None else None)
         healthy = (self.q is not None and all(b.fresh(ts, self.config.max_feed_age) for b in self.books.values()))
         # Expiry takes effect even without new book messages. Existing quotes can fill
@@ -572,6 +606,9 @@ class Engine:
                     research=dict(score=self.research_score, items=self.research_items,
                                   sources=self.research_sources,
                                   probability_adjustment=self.research_adjustment),
+                    external_confirmation=dict(source=self.external_spot_source_ts != -math.inf and "binance_spot" or None,
+                                               score=self.cross_venue_score,
+                                               probability_adjustment=self.cross_venue_adjustment),
                     open_orders=len(self.orders),
                     spot_source=self.spot_source,
                     tick_sizes={side: str(tick) for side, tick in self.ticks.items()},
@@ -581,5 +618,6 @@ class Engine:
                                  "Queue is inferred from public L2 data; no rebates credited.",
                                  "Paired payoff is terminal value, not merged or available cash."],
                     fills=self.portfolio.fills, actions=self.actions)
+
 
 

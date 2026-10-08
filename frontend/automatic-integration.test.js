@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {existsSync,rmSync} from 'node:fs';
-import {join} from 'node:path';
+import {delimiter,join} from 'node:path';
 import {AutomaticController} from './automatic-controller.js';
 import {createSdkExchange} from '../scripts/automatic-sdk.js';
 
@@ -11,7 +11,8 @@ test('controller and Python worker reconcile reversals, partial fills and shutdo
  const localPython=join(process.cwd(),'.venv',process.platform==='win32'?'Scripts':'bin',process.platform==='win32'?'python.exe':'python');
  const python=existsSync(localPython)?localPython:'python';
  const root=join(process.cwd(),'runs','integration-'+Date.now());
- const child=spawn(python,['tests/automatic_fixture.py',root],{windowsHide:true,stdio:['pipe','pipe','pipe']});
+ const child=spawn(python,['tests/automatic_fixture.py',root],{windowsHide:true,stdio:['pipe','pipe','pipe'],
+  env:{...process.env,PYTHONPATH:[join(process.cwd(),'src'),process.env.PYTHONPATH].filter(Boolean).join(delimiter)}});
  const lines=createInterface({input:child.stdout});
  const queue=[],waiters=[];
  lines.on('line',line=>{const value=JSON.parse(line);if(waiters.length)waiters.shift()(value);else queue.push(value);});
@@ -19,9 +20,13 @@ test('controller and Python worker reconcile reversals, partial fills and shutdo
    const timer=setTimeout(()=>reject(Error('Offline fixture timeout')),10000);
    waiters.push(value=>{clearTimeout(timer);resolve(value);});
  });
- child.stderr.resume();
+ let stderr='';
+ child.stderr.setEncoding('utf8');child.stderr.on('data',chunk=>{stderr+=chunk;});
  try {
-  const {url}=await next();
+  let fixture;
+  try { fixture=await next(); }
+  catch(error) { throw Error(stderr.trim()||error.message); }
+  const {url}=fixture;
   const request=async(path,body)=>{
    const response=await fetch(url+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer offline-integration',
     ...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});
@@ -68,5 +73,6 @@ test('controller and Python worker reconcile reversals, partial fills and shutdo
   rmSync(root,{recursive:true,force:true,maxRetries:10,retryDelay:100});
  }
 });
+
 
 

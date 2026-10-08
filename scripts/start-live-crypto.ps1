@@ -3,7 +3,7 @@ param(
     [switch]$EnableLive,
     [switch]$Continuous,
     [ValidateSet('btc','eth','xrp','sol')][string[]]$Assets = @('btc','eth','xrp','sol'),
-    [ValidateRange(0.01,5)][double]$OrderDollars = 1,
+    [ValidateRange(0.01,5)][double]$OrderDollars = 5,
     [ValidateRange(0.01,5)][double]$MarketDollars = 5,
     [ValidateRange(256,4096)][int]$MaxNewLogMB = 4096,
     [string]$Wallet = ''
@@ -49,4 +49,5 @@ try {
     if ($taskSecret) { $taskSecret.Dispose(); $taskSecret = $null }
     Pop-Location
 }
+
 

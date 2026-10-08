@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
 from polymarket_bot.context import parse_news, parse_social, research_signal
-from polymarket_bot.core import Engine, Market
+from polymarket_bot.core import Config, Engine, Market
+from polymarket_bot.feeds import normalize_binance_trade
 
 
 class ContextTests(unittest.TestCase):
@@ -45,7 +46,34 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(research_signal(record, "sol", now=1000)["items"], 0)
         self.assertEqual(research_signal(record, "sol", now=2000)["score"], 0)
 
+    def test_fresh_cross_venue_prices_confirm_only_when_both_clear_strike(self):
+        market = Market("btc-updown-5m-0", "up", "down", 100, 0, 300)
+        engine = Engine(market, Config(cross_venue_weight=.005))
+        engine.ingest(dict(kind="spot", ts=10, source_ts=10, price=100.03,
+                           feed="polymarket_chainlink_twap_60"))
+        engine.ingest(dict(kind="external_spot", ts=10.1, source_ts=10.05,
+                           price=100.04, feed="binance_spot"))
+        engine.ingest(dict(kind="clock", ts=11))
+        self.assertEqual(engine.cross_venue_score, 1)
+        self.assertEqual(engine.cross_venue_adjustment, .005)
+        engine.ingest(dict(kind="external_spot", ts=12, source_ts=11.9,
+                           price=99.98, feed="binance_spot"))
+        engine.ingest(dict(kind="clock", ts=12.1))
+        self.assertEqual(engine.cross_venue_score, 0)
+        engine.ingest(dict(kind="spot", ts=20, source_ts=20, price=100.03,
+                           feed="polymarket_chainlink_twap_60"))
+        engine.ingest(dict(kind="clock", ts=20.1))
+        self.assertEqual(engine.cross_venue_score, 0)
+
+    def test_binance_public_trade_is_asset_checked_and_normalized(self):
+        trade = dict(e="trade", s="ETHUSDT", p="2500.25", T=10000)
+        event = normalize_binance_trade(trade, 10.1, "ETHUSDT")[0]
+        self.assertEqual((event["kind"], event["feed"], event["price"]), ("external_spot", "binance_spot", 2500.25))
+        self.assertEqual(event["source_ts"], 10)
+        self.assertEqual(normalize_binance_trade(trade, 10.1, "BTCUSDT"), [])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

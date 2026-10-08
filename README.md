@@ -40,7 +40,7 @@ Public data can be delayed or time out. If capture stops, use `-Review` to inspe
 
 `virtual_balance` is modeled cash after finalized market payouts. `simulated_fills` are estimates based on public depth, queue position, observed aggressive trades, and latency. They are **not** exchange-confirmed fills. Public feeds can miss events; actual queue position, order acceptance, fees, cancellations, and real execution can differ. The probability model is an untrained baseline. A favorable paper result, especially from a few markets, does not establish a profitable strategy or justify refilling a live wallet. Gather a meaningful out-of-sample set of resolved markets and compare fills, trade frequency, and net results before making any live decision.
 
-The experimental research adjustment is based only on recent asset-specific public headlines with a small, disclosed positive or negative keyword score. With two scored headlines it can change Up probability by at most one percentage point; one scored headline changes it by at most half a point. Stale, irrelevant, unavailable, or ambiguous headlines are neutral. It uses the same event and strategy core in paper and staged live modes. The dashboard shows the baseline probability and actual adjustment, and paper mode evaluates matched **research-on versus baseline** variants. Headline polarity is untrained and its predictive value for five-minute markets has not been established; it may worsen results.
+The experimental research inputs include CoinDesk and Cointelegraph RSS, asset-specific Reddit posts, and a secondary Binance public spot-trade stream alongside the Polymarket/Chainlink feed. Headlines get a small disclosed keyword score; one scored item changes Up probability by at most half a percentage point and two items cap it at one point. Binance adds at most half a point only while its fresh spot price and the fresh Chainlink price both sit at least one basis point on the same side of the market strike. Stale, unavailable, irrelevant, or disagreeing sources are neutral. Paper and staged live share this event stream and core; paper compares research-on variants with a no-research/no-cross-venue baseline. These are untrained heuristics, not a validated predictive model; they may worsen results and do not establish profitability.
 
 ## Staged live mode
 
@@ -50,8 +50,24 @@ The live code is present for review, but the launcher refuses real orders unless
 .\scripts\start-live-crypto.ps1 -CheckOnly
 ```
 
-The real-funds path requires Node.js and `npm ci` in addition to the Python setup. It will ask for a wallet key only after the explicit live switch. Do not enable it based on a few paper results: the queue-based paper fills are estimated, while real fills, exchange failures, and P&L can differ. The live path has not undergone an end-to-end funded test in v2. Review a meaningful number of resolved paper markets, the execution implementation, and the current Polymarket rules before considering real funds. The strategy cannot guarantee profits or prevent losses.
+The real-funds path requires Node.js and `npm ci` in addition to the Python setup. Install the JavaScript dependencies and run the no-key preflight first:
+
+```powershell
+npm ci
+.\scripts\start-live-crypto.ps1 -CheckOnly
+```
+
+If you later choose to use a funded wallet, a **single BTC session** with a $5 maximum order, $5 total spend, and $5 market loss cap is started with:
+
+```powershell
+.\scripts\start-live-crypto.ps1 -EnableLive -Assets btc -OrderDollars 5 -MarketDollars 5
+```
+
+The script prompts for the private key with hidden terminal input; never add the key to this command, a script, a file, or an environment variable. Check that the displayed signer and trading wallet match your Polymarket account before allowing the session to proceed. This command omits `-Continuous`, so it handles one 90-second market session and then exits. The limit is per market, not a guarantee against losses or fees. The launcher can attempt to redeem resolved winning positions at the end of the session.
+
+I have not run this funded path end to end. The simulator's queue fills are estimates, not exchange-confirmed fills, and the current paper sample has not demonstrated profit. Do not treat the command as a recommendation to fund or trade: first collect a meaningful out-of-sample paper record and review the code and current market rules. The strategy cannot guarantee profits or prevent losses.
 
 The public [bonereaper profile](https://polymarket.com/@bonereaper) and [Polymarket Data API](https://data-api.polymarket.com/v2/docs) show trades on both outcomes in some short crypto markets. This motivates tracking paired P&L, but public trades do not reveal unfilled quotes, queue priority, incentives, or the complete trading rules. The simulator does not copy that account or count its profile P&L as evidence that this $50 strategy is profitable.
+
 
 

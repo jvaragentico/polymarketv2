@@ -20,6 +20,7 @@ CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CLOB_REST = "https://clob.polymarket.com"
 COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
+BINANCE_WS = "wss://stream.binance.com:9443/ws"
 
 
 def get_json(url, timeout=20):
@@ -125,6 +126,22 @@ def normalize_coinbase(message, received, product):
     return [dict(kind="spot", ts=received, source_ts=epoch(message["time"]), price=message["price"], feed="coinbase_proxy")]
 
 
+def normalize_binance_trade(message, received, symbol):
+    """Normalize Binance's public spot trade stream as secondary price confirmation."""
+    payload = message.get("data", message) if isinstance(message, dict) else {}
+    if payload.get("e") != "trade" or payload.get("s") != symbol.upper():
+        return []
+    try:
+        price = float(payload["p"])
+        source_ts = float(payload["T"]) / 1000
+    except (KeyError, TypeError, ValueError):
+        return []
+    if not math.isfinite(price) or price <= 0 or not math.isfinite(source_ts):
+        return []
+    return [dict(kind="external_spot", ts=received, source_ts=source_ts,
+                 price=price, feed="binance_spot")]
+
+
 def normalize_chainlink(message, received, symbol):
     if message.get("topic") != "crypto_prices_chainlink" or message.get("type") != "update":
         return []
@@ -217,6 +234,7 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                                           probability_up=probability,
                                           probability_up_without_research=reference.q_base,
                                           research=reference.report()["research"],
+                                          external_confirmation=reference.report()["external_confirmation"],
                                           raw_maker_edge=edges,
                                           books=prices,
                                           public_trade_updates=counts.get("trade", 0),
@@ -237,13 +255,14 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                 return seen_spot and {market.up_token, market.down_token} <= seen_books
             return bool(engine.model.samples) and all(b.initialized for b in engine.books.values())
 
-        async def reader(url, subscription, normalizer, label, ping_text=None, ping_seconds=10):
+        async def reader(url, subscription, normalizer, label, ping_text=None, ping_seconds=10, optional=False):
             reconnects = 0
             while time.monotonic() < deadline and not (stop_event and stop_event.is_set()):
                 try:
                     async with connect(url, ping_interval=20, ping_timeout=20, proxy=None,
                                        open_timeout=15, max_queue=4096) as websocket:
-                        await websocket.send(json.dumps(subscription))
+                        if subscription is not None:
+                            await websocket.send(json.dumps(subscription))
 
                         async def heartbeat():
                             while True:
@@ -279,6 +298,10 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                 except Exception as error:
                     if time.monotonic() >= deadline or (stop_event and stop_event.is_set()):
                         return
+                    if optional:
+                        print(f"Optional {label} feed unavailable; cross-venue confirmation will be neutral: {error}", flush=True)
+                        await asyncio.sleep(2)
+                        continue
                     if label == "polymarket" and reconnects < 2 and time.monotonic() + 3 < deadline:
                         reconnects += 1
                         # The previous depth stream has a gap. Cancel quotes and
@@ -341,6 +364,11 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                                                      type="market", custom_feature_enabled=True),
                                        normalize_clob, "polymarket", ping_text="PING")),
             asyncio.create_task(spot_reader),
+            asyncio.create_task(reader(
+                f"{BINANCE_WS}/{product.replace('-', '').lower().replace('usd', 'usdt')}@trade",
+                None, lambda msg, ts: normalize_binance_trade(
+                    msg, ts, product.replace('-', '').replace('USD', 'USDT')),
+                "binance_spot", optional=True)),
         ]
         if capture_only:
             tasks.append(asyncio.create_task(rest_books()))
@@ -386,5 +414,6 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
     if errors:
         raise RuntimeError("; ".join(errors) + f". Partial recording preserved in {output}")
     return report
+
 
 
