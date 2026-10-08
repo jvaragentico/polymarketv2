@@ -145,9 +145,11 @@ def summary(root):
     for name, cap in CAPS.items():
         balance = STARTING_BALANCE
         fills = settled = markets_with_fills = wins = losses = 0
+        gross_profit = gross_loss = Decimal("0")
         paired_pnl = Decimal("0")
         by_asset = {asset: dict(settled_markets=0, simulated_fills=0,
                                 wins=0, losses=0, realized_pnl="0",
+                                gross_profit="0", gross_loss="0",
                                 paired_terminal_pnl="0") for asset in ASSETS}
         pending = []
         excluded = []
@@ -170,6 +172,8 @@ def summary(root):
                 blocked = True
                 continue
             pnl = Decimal(portfolio["realized_pnl"])
+            gross_profit += max(pnl, Decimal("0"))
+            gross_loss += min(pnl, Decimal("0"))
             pair_result = Decimal(portfolio["paired_terminal_pnl"])
             paired_pnl += pair_result
             balance += pnl
@@ -180,6 +184,8 @@ def summary(root):
             asset_result["wins"] += pnl > 0
             asset_result["losses"] += pnl < 0
             asset_result["realized_pnl"] = str(Decimal(asset_result["realized_pnl"]) + pnl)
+            asset_result["gross_profit"] = str(Decimal(asset_result["gross_profit"]) + max(pnl, Decimal("0")))
+            asset_result["gross_loss"] = str(Decimal(asset_result["gross_loss"]) + min(pnl, Decimal("0")))
             asset_result["paired_terminal_pnl"] = str(Decimal(asset_result["paired_terminal_pnl"]) + pair_result)
             winner_token = json.loads((directory / "settlement.json").read_text(encoding="utf-8"))["winner"]
             winner_side = "Up" if winner_token == report["market"]["up_token"] else "Down"
@@ -197,6 +203,7 @@ def summary(root):
                               settled_markets=settled, markets_with_fills=markets_with_fills,
                               simulated_fills=fills, wins=wins, losses=losses,
                               realized_pnl=str(balance - STARTING_BALANCE),
+                              gross_profit=str(gross_profit), gross_loss=str(gross_loss),
                               paired_terminal_pnl=str(paired_pnl),
                               virtual_balance=str(balance), pending=pending, excluded=excluded,
                               by_asset=by_asset, recent_markets=recent_markets[-20:])

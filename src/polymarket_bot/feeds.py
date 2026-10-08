@@ -199,9 +199,11 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                           for side, book in reference.books.items()}
                 spot = (math.exp(reference.model.samples[-1][1])
                         if reference.model.samples else None)
+                books_fresh = all(book.fresh(reference.now, config.max_feed_age)
+                                  for book in reference.books.values())
                 edges = ({"Up": probability - float(reference.books["Up"].bid),
                           "Down": 1 - probability - float(reference.books["Down"].bid)}
-                         if probability is not None else {})
+                         if probability is not None and books_fresh else {})
                 chart.append(dict(ts=clock(), twap=spot, probability_up=probability,
                                   up_bid=float(reference.books["Up"].bid),
                                   down_bid=float(reference.books["Down"].bid),

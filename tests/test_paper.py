@@ -75,6 +75,8 @@ class PaperTests(unittest.TestCase):
             self.assertTrue(replay(run / "events.jsonl")["portfolio"]["resolved"])
             result = summary(root)
             self.assertEqual(Decimal(result["variants"]["one_dollar"]["virtual_balance"]), Decimal("50"))
+            self.assertEqual(Decimal(result["variants"]["one_dollar"]["gross_profit"]), Decimal("0"))
+            self.assertEqual(Decimal(result["variants"]["one_dollar"]["gross_loss"]), Decimal("0"))
             self.assertEqual(result["variants"]["five_dollar"]["settled_markets"], 1)
             self.assertEqual(result["variants"]["five_dollar"]["by_asset"]["btc"]["settled_markets"], 1)
             self.assertEqual(result["variants"]["five_dollar"]["recent_markets"][0]["winner"], "Up")
