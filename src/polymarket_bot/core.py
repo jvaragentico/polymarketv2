@@ -41,6 +41,7 @@ class Config:
     model_window: float = 120
     volatility_floor: float = .00005
     momentum_weight: float = .15
+    research_weight: float = .01
 
     def __post_init__(self):
         for key, value in asdict(self).items():
@@ -61,6 +62,8 @@ class Config:
             raise ValueError("max_market_spend cannot exceed capital")
         if not 0 < self.max_entry_price <= 1:
             raise ValueError("max_entry_price must be in (0, 1]")
+        if self.research_weight > .02:
+            raise ValueError("research_weight cannot exceed two probability points")
 
 
 @dataclass
@@ -310,6 +313,12 @@ class Engine:
         self.last_decision = -math.inf
         self.halted = None
         self.q = None
+        self.q_base = None
+        self.research_score = 0.0
+        self.research_items = 0
+        self.research_at = -math.inf
+        self.research_sources = []
+        self.research_adjustment = 0.0
         self.actions = []
         self.events = 0
         self.trade_ids = set()
@@ -334,12 +343,22 @@ class Engine:
         self.now = ts
         self.events += 1
         kind = event["kind"]
-        if kind not in {"spot", "book", "delta", "tick", "resolution", "disconnect", "feed_reset", "trade", "clock", "session_stop"}:
+        if kind not in {"spot", "book", "delta", "tick", "resolution", "disconnect", "feed_reset", "trade", "clock", "session_stop", "research"}:
             raise ValueError(f"Unknown event kind: {kind}")
         # Apply the observation first: delayed orders use the book available at arrival.
         if kind == "spot":
             self.model.update(ts, float(event["price"]), float(event.get("source_ts", ts)))
             self.spot_source = event.get("feed", "unspecified")
+        elif kind == "research":
+            score = float(event["score"])
+            items = event["items"]
+            if (not math.isfinite(score) or not -1 <= score <= 1 or
+                    not isinstance(items, int) or isinstance(items, bool) or items < 0):
+                raise ValueError("Invalid research signal")
+            self.research_score = score
+            self.research_items = items
+            self.research_at = ts
+            self.research_sources = list(event.get("sources", []))
         elif kind in ("book", "delta"):
             self.books[self.market.outcome(event["token"])].update(event)
         elif kind == "tick":
@@ -370,7 +389,12 @@ class Engine:
                 book.initialized = False
                 book.bids.clear()
                 book.asks.clear()
-        self.q = self.model.probability(ts, self.market)
+        self.q_base = self.model.probability(ts, self.market)
+        adjustment = (self.config.research_weight * self.research_score *
+                      min(1, self.research_items / 2)) if ts - self.research_at <= 900 else 0
+        self.research_adjustment = adjustment
+        self.q = (max(.01, min(.99, self.q_base + adjustment))
+                  if self.q_base is not None else None)
         healthy = (self.q is not None and all(b.fresh(ts, self.config.max_feed_age) for b in self.books.values()))
         # Expiry takes effect even without new book messages. Existing quotes can fill
         # during cancellation latency; stale feeds never authorize new fills.
@@ -544,7 +568,11 @@ class Engine:
     def report(self):
         return dict(market=asdict(self.market), config=asdict(self.config),
                     paper_only=True, events=self.events, halted=self.halted,
-                    probability_up=self.q, open_orders=len(self.orders),
+                    probability_up=self.q, probability_up_without_research=self.q_base,
+                    research=dict(score=self.research_score, items=self.research_items,
+                                  sources=self.research_sources,
+                                  probability_adjustment=self.research_adjustment),
+                    open_orders=len(self.orders),
                     spot_source=self.spot_source,
                     tick_sizes={side: str(tick) for side, tick in self.ticks.items()},
                     portfolio=self.portfolio.report(self.books),

@@ -20,7 +20,8 @@ from .replay import replay
 
 
 STARTING_BALANCE = Decimal("50")
-CAPS = {"one_dollar": Decimal("1"), "five_dollar": Decimal("5")}
+CAPS = {"one_dollar": Decimal("1"), "five_dollar": Decimal("5"),
+        "one_dollar_baseline": Decimal("1"), "five_dollar_baseline": Decimal("5")}
 
 
 def public_clock_offset():
@@ -41,7 +42,7 @@ def public_clock_offset():
     raise ValueError("Could not verify public server time")
 
 
-def paper_config(balance, cap):
+def paper_config(balance, cap, research_weight=.01):
     """Match the live maker settings while limiting simulated market exposure."""
     balance, cap = Decimal(str(balance)), Decimal(str(cap))
     budget = min(balance, cap)
@@ -49,7 +50,8 @@ def paper_config(balance, cap):
         raise ValueError("Virtual bankroll is below the minimum paper budget")
     return Config(capital=float(balance), order_dollars=float(budget),
                   max_market_spend=float(budget), max_loss=float(budget),
-                  max_net_shares=20, allow_taker=False, quote_lifetime=8)
+                  max_net_shares=20, allow_taker=False, quote_lifetime=8,
+                  research_weight=research_weight)
 
 
 def official_winner(raw, market, expected_condition):
@@ -157,7 +159,8 @@ def summary(root):
                 continue
             try:
                 recording_identity(directory)
-                report = replay(directory / "events.jsonl", paper_config(balance, cap))
+                report = replay(directory / "events.jsonl", paper_config(
+                    balance, cap, 0 if name.endswith("_baseline") else .01))
             except (OSError, ValueError, KeyError, TypeError, StopIteration):
                 excluded.append(directory.name)
                 continue
@@ -189,7 +192,8 @@ def summary(root):
             markets_with_fills += portfolio["fills"] > 0
             wins += pnl > 0
             losses += pnl < 0
-        variants[name] = dict(order_cap=str(cap), starting_balance=str(STARTING_BALANCE),
+        variants[name] = dict(order_cap=str(cap), research_weight=(0 if name.endswith("_baseline") else .01),
+                              starting_balance=str(STARTING_BALANCE),
                               settled_markets=settled, markets_with_fills=markets_with_fills,
                               simulated_fills=fills, wins=wins, losses=losses,
                               realized_pnl=str(balance - STARTING_BALANCE),
@@ -216,7 +220,8 @@ def record_one(root, after_slug=None, clock=time.time, asset="btc"):
     try:
         asyncio.run(shadow(market, paper_config(STARTING_BALANCE, 1), f"{asset.upper()}-USD", 90,
                            directory, spot_feed="chainlink_twap", clock=clock, capture_only=True,
-                           preview_configs={name: paper_config(STARTING_BALANCE, cap)
+                           preview_configs={name: paper_config(STARTING_BALANCE, cap,
+                                            0 if name.endswith("_baseline") else .01)
                                             for name, cap in CAPS.items()}))
     finally:
         if (directory / "events.jsonl").exists():

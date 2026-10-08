@@ -1,6 +1,7 @@
 """Read-only public APIs. No credentials, signatures, or trading endpoints."""
 
 import asyncio
+from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 import json
@@ -11,6 +12,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from .core import Engine, Market
+from .context import ResearchCache, research_signal
 
 GAMMA = "https://gamma-api.polymarket.com"
 DATA = "https://data-api.polymarket.com"
@@ -152,6 +154,11 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
     output.mkdir(parents=True, exist_ok=False)
     engine = None if capture_only else (engine if engine is not None else Engine(market, config))
     preview_engines = {name: Engine(market, settings) for name, settings in (preview_configs or {}).items()}
+    research_cache = ResearchCache()
+    asset = market.slug.split("-", 1)[0]
+    research_cache.get(asset)
+    research_recorded = False
+    chart = deque(maxlen=90)
     header = dict(kind="meta", schema=1, market=asdict(market), config=asdict(config),
                   source="live_public", product=product, spot_feed=spot_feed, captured_at=clock(),
                   book_mode="rest_snapshots" if capture_only else "snapshots_and_deltas")
@@ -184,8 +191,8 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                 preview.ingest(event)
 
         def save_preview():
-            if preview_engines:
-                reference = next(iter(preview_engines.values()))
+            if preview_engines or engine is not None:
+                reference = next(iter(preview_engines.values())) if preview_engines else engine
                 probability = reference.q
                 prices = {side: dict(bid=str(book.bid), ask=str(book.ask),
                                      fresh=bool(book.fresh(reference.now, config.max_feed_age)))
@@ -195,13 +202,19 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                 edges = ({"Up": probability - float(reference.books["Up"].bid),
                           "Down": 1 - probability - float(reference.books["Down"].bid)}
                          if probability is not None else {})
-                state = dict(updated_at=clock(), market=market.slug, paper_only=True,
+                chart.append(dict(ts=clock(), twap=spot, probability_up=probability,
+                                  up_bid=float(reference.books["Up"].bid),
+                                  down_bid=float(reference.books["Down"].bid),
+                                  marked_pnl=float(reference.portfolio.report(reference.books)["conservative_mark_pnl"])))
+                state = dict(updated_at=clock(), market=market.slug, paper_only=capture_only,
                              provisional=True,
                              signals=dict(twap_price=spot,
                                           twap_age_seconds=(reference.now - reference.model.source_ts
                                                             if spot is not None else None),
                                           opening_reference=market.strike,
                                           probability_up=probability,
+                                          probability_up_without_research=reference.q_base,
+                                          research=reference.report()["research"],
                                           raw_maker_edge=edges,
                                           books=prices,
                                           public_trade_updates=counts.get("trade", 0),
@@ -209,8 +222,10 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
                                           model_source="Polymarket Chainlink 60-second TWAP",
                                           book_source="Polymarket public CLOB REST",
                                           trade_source="Polymarket public CLOB WebSocket",
-                                          research_feeds_used_for_orders=False),
-                             variants={name: preview.report() for name, preview in preview_engines.items()})
+                                          research_feeds_used_for_orders=reference.research_items > 0),
+                             chart=list(chart),
+                             variants=({name: preview.report() for name, preview in preview_engines.items()}
+                                       if preview_engines else {"live": engine.report()}))
                 temporary = output / "live-state.tmp"
                 temporary.write_text(json.dumps(state), encoding="utf-8")
                 temporary.replace(output / "live-state.json")
@@ -333,6 +348,12 @@ async def shadow(market, config, product, seconds, output, spot_feed="chainlink"
             while time.monotonic() < deadline and not errors and not (stop_event and stop_event.is_set()):
                 await asyncio.sleep(min(.25, max(0, deadline - time.monotonic())))
                 emit(dict(kind="clock", ts=clock()))
+                if not research_recorded:
+                    record = research_cache.get(asset)
+                    if record.get("status") == "ready":
+                        signal = research_signal(record, asset, clock())
+                        emit(dict(kind="research", ts=clock(), **signal))
+                        research_recorded = True
                 if time.monotonic() >= next_preview:
                     save_preview()
                     next_preview += 2

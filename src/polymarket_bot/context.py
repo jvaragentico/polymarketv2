@@ -1,6 +1,8 @@
-"""Optional public news and social headlines for paper research, never order signals."""
+"""Public research headlines and a small, inspectable experimental signal."""
 
+from datetime import datetime
 from email.utils import parsedate_to_datetime
+import re
 import threading
 import time
 from urllib.request import Request, urlopen
@@ -18,6 +20,44 @@ KEYWORDS = {
     "xrp": ("xrp", "ripple"), "sol": ("solana", "sol"),
 }
 ATOM = "{http://www.w3.org/2005/Atom}"
+POSITIVE = ("rally", "surge", "record high", "approval", "breakout", "soars")
+NEGATIVE = ("crash", "plunge", "exploit", "hack", "lawsuit", "selloff")
+
+
+def research_signal(record, asset, now=None):
+    """Score only fresh, asset-relevant public headlines; missing data is neutral."""
+    now = time.time() if now is None else now
+    if record.get("status") != "ready" or now - record.get("checked_at", 0) > 900:
+        return dict(score=0.0, items=0, sources=[], reason="research unavailable or stale")
+    values, sources = [], []
+    for source, rows in (("news", record.get("news", [])), ("social", record.get("social", []))):
+        if record.get(source + "_status") != "ok":
+            continue
+        for row in rows:
+            title = row.get("title", "").lower()
+            if source == "news" and row.get("asset_match") is not True:
+                continue
+            if source == "social" and not any(re.search(r"\b" + re.escape(word) + r"\b", title)
+                                              for word in KEYWORDS[asset]):
+                continue
+            published = row.get("published_at")
+            try:
+                stamp = (float(published) if isinstance(published, (float, int)) else
+                         datetime.fromisoformat(published.replace("Z", "+00:00")).timestamp())
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if not 0 <= now - stamp <= 900:
+                continue
+            positive = any(re.search(r"\b" + re.escape(word) + r"\b", title) for word in POSITIVE)
+            negative = any(re.search(r"\b" + re.escape(word) + r"\b", title) for word in NEGATIVE)
+            if positive == negative:
+                continue
+            values.append(1 if positive else -1)
+            if source not in sources:
+                sources.append(source)
+    score = sum(values) / len(values) if values else 0.0
+    return dict(score=score, items=len(values), sources=sources,
+                reason="experimental headline polarity" if values else "no fresh directional headlines")
 
 
 def fetch_xml(url):
@@ -32,7 +72,8 @@ def parse_news(root, asset):
     general = []
     for item in root.findall("./channel/item"):
         title = (item.findtext("title") or "").strip()
-        relevant = any(word in title.lower() for word in KEYWORDS[asset])
+        relevant = any(re.search(r"\b" + re.escape(word) + r"\b", title.lower())
+                       for word in KEYWORDS[asset])
         published = item.findtext("pubDate")
         try:
             stamp = parsedate_to_datetime(published).timestamp()
@@ -65,16 +106,16 @@ class ResearchCache:
 
     def get(self, asset):
         if asset not in SOCIAL_URLS:
-            return dict(status="unsupported", used_for_orders=False)
+            return dict(status="unsupported")
         with self.lock:
-            record = self.records.get(asset, dict(status="loading", used_for_orders=False))
+            record = self.records.get(asset, dict(status="loading"))
             if asset not in self.loading and time.time() - record.get("checked_at", 0) > 300:
                 self.loading.add(asset)
                 threading.Thread(target=self._refresh, args=(asset,), daemon=True).start()
             return record.copy()
 
     def _refresh(self, asset):
-        result = dict(checked_at=time.time(), used_for_orders=False,
+        result = dict(checked_at=time.time(),
                       news_source=NEWS_URL, social_source=SOCIAL_URLS[asset])
         for name, url, parser in (("news", NEWS_URL, lambda root: parse_news(root, asset)),
                                   ("social", SOCIAL_URLS[asset], parse_social)):
